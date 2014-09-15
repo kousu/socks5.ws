@@ -3,9 +3,11 @@ SOCKS5 in WebSockets
 
 
 SOCKS5 is a dead simple little protocol that makes very thin TCP and UDP proxies.
-SOCKS is notable because it allows proxying. Since this 
+SOCKS is notable because it allows the client to decide where to proxy to.
 
-This code implements it on top of WebSockets. If you point [websockify](https://github.com/kanaka/websockify/) at a SOCKS proxy
+This code implements SOCKS5 on top of WebSockets. If you point [websockify](https://github.com/kanaka/websockify/) at a SOCKS proxy, you will be able to proxy from your web browser to anywhere in the world.
+
+
 
 
 Demo
@@ -34,14 +36,38 @@ Then the demo script will appear to google (or whoever you hit) to be coming fro
 
 The same library also works in your browser!
 
+API
+---
+
+The API is based heavily on Promises/A+, which allows writing async code in a nearly-synchronous way.
+
+```
+var prx = new SOCKS5("ws://my-socks-proxy:1080", "bbs-site.com:666")
+prx.onopen = function() {
+  prx.send("Hello!")
+  prx.read(20).then(function(data) {
+    //...
+  }).then(function() { return prx.read(21) }) //It is important to wrap future reads in
+                                              // thunks so that reads are ordered properly.
+  .then(function(data) {                      //When the promise of prx.read() resolves,
+                                              // its value ends up in 'data'.
+    //...
+  })
+}
+```
+
+
+
 SOCKS software
 --------------
 
 Servers:
 
-* [ssh](http://www.openssh.com/) has a `-D` switch which makes your local machine into a SOCKS proxy, tunneling through to the other end of your ssh session. By default it only allows connections.
-* [dante](http://www.inet.no/dante/) is a little more fully featured SOCKS system.
-* [tor](http://torproject.org) relies totally on SOCKS to move your traffic off your computer and into the TOR mixnet.
+* [ssh](http://www.openssh.com/) has a `-D` switch which makes your local machine into a SOCKS proxy,
+        tunneling through to the other end of your ssh session. By default it only allows connections from
+        localhost which is reasonably secure for short term use like getting around a school firewall.
+* [dante](http://www.inet.no/dante/) is a little more fully featured SOCKS system with whitelisting and bandwidth throttling.
+* [tor](http://torproject.org) relies crucially on SOCKS to move your traffic--including your DNS traffic--off your computer and into the TOR mixnet.
 
 Clients:
 

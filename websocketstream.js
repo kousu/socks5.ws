@@ -46,16 +46,8 @@ NOTE: only one of these can be active at a time; if you try to call recv() while
  * [x] WebSockify, which I'm testing against (and which this is mostly useful with) insists on me specifying "binary" or "base64" in the protocols argument.
      [ ] Make sure upstream accepts my patch
      [ ] Support the "protocols" option somehow.
+ * [ ] Is it actually necessary to force only one read at a time? Perhaps multiple reads could simply queue.
 */
-
-
-// XXX a complication:
-// 
-// with 'binary' e.data ends up as a Blob which requires a whole slew of JS objects to manipulate: FileReader and ArrayBuffer. FileReader.readAsBinaryString + FileReader.result is the shortest way to just getting the bytes out, however readAsBinaryString has been deprecated for 2 years.
-// readAsText assumes the data is UTF-8 (or otherwise specified) text and will decode as approproate
-// readAsArrayBuffer just pushes the trouble of manipulation to learning the ArrayBuffer class
-//
-// For development, I'm going to force base64. I don't know if non-WebSockify WebSocketServers will understand it, but I can cross that bridge later. 
 
 function WebSocketStream(addr) {
   var self = this; //so that we can refer to the WebSocketStream from the WebSocket's event handlers
@@ -64,7 +56,7 @@ function WebSocketStream(addr) {
   
   this._pending = null;
   
-  this._ws = new WebSocket(addr, "binary");
+  this._ws = new WebSocket(addr);
   
   this._ws.onmessage = function(e) {
     self._pushbuffer(e.data);
