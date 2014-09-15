@@ -18,6 +18,9 @@
  * [ ] Instead of using Strings everywhere, use integer enum codes and have a single function that does conversion between ints and (network ordered!) byte strings
  * [ ] factor the common parts of the protocol in some way that allows implementing all three kinds of APIs is feasible
  * [ ] unit tests!!
+ * [ ] Perhaps onopen should use.. promises? Backbone.Events?
+ * [ ] LOGIN auth
+ * [ ] GSSAPI auth (i feel like this is a wontfix; the spec is dumb to enforce a complicated API into a simple protocol)
  */ 
 
 // UMD header
