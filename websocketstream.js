@@ -58,18 +58,18 @@ function WebSocketStream(addr) {
   
   this._ws = new WebSocket(addr);
   
+  
+  // 
+  // event handlers need to be defined inside here
+  // in order to pick up 'self' not cause infinite recurision
+  //  saying .e.g this._ws.onopen = this._onopen does the wrong thing, because js doesn't care that this._onopen comes from this, it runs it with this=this._ws
+  
   this._ws.onmessage = function(e) {
     self._pushbuffer(e.data);
   }
   
-  // these handlers which proxy need to be defined in here
-  // in order to pick up 'self' and not cause infinite recurision
-  //  saying .e.g this._ws.onopen = this._onopen does the wrong thing, because js doesn't care that this._onopen comes from this, it runs it with this=this._ws
-  this._ws.onopen = function(e) {
-    if(self.onopen) {
-      self.onopen(e)
-    }
-  }
+  // proxy some WebSocket events up unmolested
+  this._ws.onopen = function(e) { self.onopen(e) }
   this._ws.onclose = function(e) {
     // clear out a pending .recv()
     if(self._pending !== null) {
@@ -77,17 +77,9 @@ function WebSocketStream(addr) {
         self._pending.deferred.resolve(self._buffer)
       }
     }
-    if(self.onclose) {
-      self.onclose(e)
-    }
+    self.onclose(e)
   }
-  this._ws.onerror = function(e) {
-    if(self.onerror) {
-      self.onerror(e)
-    }
-  }
-  
-  
+  this._ws.onerror = function(e) { self.onerror(e) }
 }
 
 WebSocketStream.prototype._pushbuffer = function(d) {
@@ -127,6 +119,13 @@ WebSocketStream.prototype._RECVn = 1
 WebSocketStream.prototype._RECVLINE = 2
 WebSocketStream.prototype._RECV = 3 //XXX NotImplemented
   
+  
+// default no-op event handlers so that we needn't worry
+// about checking their existence before calling them.
+WebSocketStream.prototype.onopen = function(evt) {} 
+WebSocketStream.prototype.onclose = function(evt) {} 
+WebSocketStream.prototype.onerror = function(evt) {} 
+
 WebSocketStream.prototype.send = function(data) {
   
   if(typeof(data) === "string") {

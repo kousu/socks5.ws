@@ -17,10 +17,12 @@
        header we send depends on the format we send the address in.
  * [ ] Instead of using Strings everywhere, use integer enum codes and have a single function that does conversion between ints and (network ordered!) byte strings
  * [ ] factor the common parts of the protocol in some way that allows implementing all three kinds of APIs is feasible
- * [ ] unit tests!!
+ * [ ] Auth methods need to support callbacks so that when the server prompts; handling this generally is hard! What do we do.. we could call an event handler and demand that it return something? And it doesn't look like either Gnome or Firefox support SOCKS with passwords. Actually, SOCKS with passwords is wildly stupid since SOCKS supports; though in principle SOCKS is extensible with other 'methods' which can do anything: auth, privacy and/or MACing.
+ * [ ] unit tests!! 
  * [ ] Perhaps onopen should use.. promises? Backbone.Events?
  * [ ] LOGIN auth
  * [ ] GSSAPI auth (i feel like this is a wontfix; the spec is dumb to enforce a complicated API into a simple protocol)
+ * [ ] Make sure that if the underlying WebSocket fallsover that w eknow about it (that is, hook its onclose)
  */ 
 
 // UMD header
@@ -63,37 +65,47 @@ function build_int(n) {
 }
 
 
-function SOCKS5(proxy, target, user, pass) {
+
+function SOCKS5(proxy, auth_callback) {
   /* implements the SOCKS5 client protocol
    *  reference: https://tools.ietf.org/html/rfc1928
    *  
    * This class only implements TCP CONNECT SOCKS; SOCKS also allows UDP and even BIND modes, but those types require distinctly different APIs (UDP needs .send() and .onmessage; BIND only allows one remote TCP connection (i.e. it's not a full listen()+accept() implementation) but presumably there should be an intermediate state for "connected to the proxy but no one is connected to us"
-
+   *
+   * BEWARE: this is a metaclass--sortof--so it's written sort of funny; SOCKS5 cannot be instatiated, yet it has a full .prototype;
    */
+  
+  if(this instanceof SOCKS5) {
+    throw "You must *not* call SOCKS5 with 'new'" // there is no way in javascript to create metaclasses this with 'new' since classes must be functions, so a metaclass needs to be a function that returns a function
+  }
   
   //A) initializations
   
-  var self = this;
-  self.target = target
-  self.remote = { host: null, port: null } //the address of the remote end of the tunnel
-  
-  self._ws = new WebSocketStream(proxy)
-  
-  self._ws.onopen = function() {
-    self._connect()
+  function SOCKS5WebSocket(address, protocols) {
+    var self = this;
+    self.target = address;
+    self.remote = { host: null, port: null } //the address of the remote end of the tunnel
+    
+    // Internally we use a WebSocketStream to do the initial setup
+    self._ws = new WebSocketStream(proxy)
+    
+    self._ws.onopen = function(evt) {
+      self._connect()
+    }
+    
+    // proxy some WebSocketStream events up unmolested
+    self._ws.onclose = function(evt) {
+      self.onclose(evt)
+    }
+    self._ws.onerror = function(evt) {
+      self.onerror(evt)
+    }
   }
   
-  self._ws.onclose = function() {
-    self.onclose()
-  }
-  self._ws.onerror = function() {
-    self.onerror()
-  }
+  SOCKS5WebSocket.prototype = SOCKS5.prototype;
+  
+  return SOCKS5WebSocket;
 }
-
-// make SOCKS5 inherit from WebSocketStream
-// trick from http://ncombo.wordpress.com/2013/07/11/javascript-inheritance-done-right/
-//SOCKS5.prototype = Object.create(WebSocketStream.prototype);
 
 
 SOCKS5.prototype._validate_version = function(b) {
@@ -108,9 +120,16 @@ SOCKS5.prototype._validate_version = function(b) {
 SOCKS5.prototype._connect = function() {
   var self = this;
   return this._negotiate_method()
-    .then(function(m) { return self._negotiate_auth(m) }) //the wrapping is because then() suffers from changing what 'this' is
-    .then(function() { return self._negotiate_connection() } )
-    .then(function() { return self.onopen({/*XXX fill me in*/}) })
+    .then(function(m) { 
+      return self._negotiate_auth(m) }) //the wrapping is because then() suffers from changing what 'this' is
+    .then(function() { 
+      return self._negotiate_connection() })
+    .then(function() { 
+      // C) Get out of the way: just forward packets
+      //   we *disable* the WebSocketStream when we do this by stealing the onmessage
+      self._ws._ws.onmessage = function(e) { self.onmessage(e) }
+      return self.onopen({/*XXX fill in some sensible event result here */})
+      })
     .fail(function(e) { self.onerror(e) }) //chain exceptions out to the event handler
 }
 
@@ -345,24 +364,6 @@ SOCKS5.prototype._read_reply = function() {
 }
 
 
-// C) Get out of the way: just forward packets
-//
-
-SOCKS5.prototype.recv = function(n) {
-  // XXX I don't think I'm doing this right
-  // TODO: ensure that recv() on the outer can be called before the SOCKS negotiation is done
-  //  it should block until
-  // XXX as written this could interfere with the SOCKS negotiation and totally screw up everything
-  
-  return this._ws.recv(n)
-}
-
-SOCKS5.prototype.recvline = function() {
-  // XXX I don't think I'm doing this right
-  // TODO: ensure that recv() on the outer can be called before the SOCKS negotiation is done
-  
-  return this._ws.recvline()
-}
 
 SOCKS5.prototype.send = function(d) {
   return this._ws.send(d)
@@ -372,7 +373,10 @@ SOCKS5.prototype.close = function() {
   return this._ws.close();
 }
 
+// default no-op event handlers so that we needn't worry
+// about checking their existence before calling them.
 SOCKS5.prototype.onopen = function(evt) {} 
+SOCKS5.prototype.onmessage = function(evt) {} 
 SOCKS5.prototype.onclose = function(evt) {} 
 SOCKS5.prototype.onerror = function(evt) {} 
 

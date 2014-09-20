@@ -11,27 +11,32 @@ if(!target) {
   target = "uwaterloo.ca:80"
 }
 
-var prx = new SOCKS5("ws://localhost:8081", target)
+// auth needs to be handled by some sort of callback..?
+var prx = SOCKS5("ws://localhost:8081");
 
-prx.onopen = function() {
+var ws = new prx(target)
+
+// this part onwards is drop-in websockets compatible
+
+ws.onopen = function() {
   console.log("Requesting HTTP from ", target)
-  prx.send("GET / HTTP/1.1\r\n\r\n")
-  
-  prx.recv().then(function(e) {
-    console.log("Response:")
-    console.log(e);
-  })
+  this.send("GET / HTTP/1.1\r\n\r\n")  
 }
 
-prx.onerror = function(e) {
+ws.onmessage = function(e) {
+  console.log("Response:")
+  console.log(e.data);
+}
+
+ws.onerror = function(e) {
   console.log("It blew up!")
   console.log(e)
 }
 
 
 setTimeout(function() {
-  console.log("timeout")
-  prx.close();
+  console.log("Timeout.")
+  ws.close();
 }, 15*1000)
 /*
 or proxy via 
