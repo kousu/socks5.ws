@@ -23,6 +23,7 @@
  * [ ] LOGIN auth
  * [ ] GSSAPI auth (i feel like this is a wontfix; the spec is dumb to enforce a complicated API into a simple protocol)
  * [ ] Make sure that if the underlying WebSocket fallsover that w eknow about it (that is, hook its onclose)
+ * [ ] Make sure that SOCKS5WebSocket actually supports the complete WebSocket API (how do we do readyState??)
  */ 
 
 // UMD header
@@ -70,51 +71,52 @@ function build_int(n) {
 
 
 function SOCKS5(proxy, auth_callback) {
+  /* This partially-evaluates SOCKS5WebSocket
+   *  doing this requires bending over backwards a bit, because we want to support 'new'
+   *  hence, we basically dynamically create a subclass which closes over 'proxy' and 'auth_callback'
+   */
+  function WebSocket(address, protocols) {
+    //using SOCKS5WebSocket.call(this, ...) makes
+    //      var C = SOCKS5(...); new C(...) behave properly
+    SOCKS5WebSocket.call(this, proxy, auth_callback, address, protocols);
+  }
+  WebSocket.prototype = SOCKS5WebSocket.prototype;
+  return WebSocket;
+}
+
+function SOCKS5WebSocket(proxy, auth_callback, address, protocols) {
   /* implements the SOCKS5 client protocol
    *  reference: https://tools.ietf.org/html/rfc1928
    *  
    * This class only implements TCP CONNECT SOCKS; SOCKS also allows UDP and even BIND modes, but those types require distinctly different APIs (UDP needs .send() and .onmessage; BIND only allows one remote TCP connection (i.e. it's not a full listen()+accept() implementation) but presumably there should be an intermediate state for "connected to the proxy but no one is connected to us"
-   *
-   * BEWARE: this is a metaclass--sortof--so it's written sort of funny; SOCKS5 cannot be instatiated, yet it has a full .prototype;
    */
+ 
+  var self = this;
+  self.target = address;
+  self.remote = { host: null, port: null } //the address of the remote end of the tunnel
   
-  if(this instanceof SOCKS5) {
-    throw "You must *not* call SOCKS5 with 'new'" // there is no way in javascript to create metaclasses this with 'new' since classes must be functions, so a metaclass needs to be a function that returns a function
+  self._ws = new WebSocket(proxy)
+  
+  // Though it is unlikely, I do not trust that TCP or WebSockets will not break up the SOCKS5 messages in funny ways
+  // Hence, internally I use a WebSocketStream to do the initial setup
+  // The WebSocketStream is deleted once the SOCKS headers are done.
+  self._stream = new WebSocketStream(this._ws)
+  self._stream.onopen = function(evt) {
+    self._connect()
   }
   
-  //A) initializations
-  
-  function SOCKS5WebSocket(address, protocols) {
-    var self = this;
-    self.target = address;
-    self.remote = { host: null, port: null } //the address of the remote end of the tunnel
-    
-    self._ws = new WebSocket(proxy)
-    
-    // Though it is unlikely, I do not trust that TCP or WebSockets will not break up the SOCKS5 messages in funny ways
-    // Hence, internally I use a WebSocketStream to do the initial setup
-    // The WebSocketStream is deleted once the SOCKS headers are done.
-    self._stream = new WebSocketStream(this._ws)
-    self._stream.onopen = function(evt) {
-      self._connect()
-    }
-    
-    // proxy some WebSocketStream events up unmolested
-    self._ws.onclose = function(evt) {
-      self.onclose(evt)
-    }
-    self._ws.onerror = function(evt) {
-      self.onerror(evt)
-    }
+  // proxy some WebSocketStream events up unmolested
+  self._ws.onclose = function(evt) {
+    self.onclose(evt)
   }
-  
-  SOCKS5WebSocket.prototype = SOCKS5.prototype;
-  
+  self._ws.onerror = function(evt) {
+    self.onerror(evt)
+  }
   return SOCKS5WebSocket;
 }
 
 
-SOCKS5.prototype._validate_version = function(b) {
+SOCKS5WebSocket.prototype._validate_version = function(b) {
   if(b != this.VERSION) { 
     throw "Unsupported SOCKS version"
   }
@@ -123,7 +125,7 @@ SOCKS5.prototype._validate_version = function(b) {
 
 // B) connect to the SOCKS server  
   
-SOCKS5.prototype._connect = function() {
+SOCKS5WebSocket.prototype._connect = function() {
   var self = this;
   return this._negotiate_method()
     .then(function(m) { return self._negotiate_auth(m) }) //the wrapping is because then() suffers from changing what 'this' is
@@ -143,7 +145,7 @@ SOCKS5.prototype._connect = function() {
 
 // 1) negotiate an connection method (i.e. an auth method, though encryption and digital signatures are theoretically an option here too);
 
-SOCKS5.prototype._negotiate_method = function() {
+SOCKS5WebSocket.prototype._negotiate_method = function() {
   this._stream.send(this._build_method_selection([this.auth.NONE]))
   
   return this._read_method();
@@ -151,7 +153,7 @@ SOCKS5.prototype._negotiate_method = function() {
 
 
 
-SOCKS5.prototype._build_method_selection = function(methods) {
+SOCKS5WebSocket.prototype._build_method_selection = function(methods) {
   // precondition: methods is a subset of this.auth
   // XXX this precondition isn't enforced!
   
@@ -161,7 +163,7 @@ SOCKS5.prototype._build_method_selection = function(methods) {
 }
 
 
-SOCKS5.prototype._read_method = function() {
+SOCKS5WebSocket.prototype._read_method = function() {
   var self = this;
   return self._stream.recv(1)
     .then(function(b) { self._validate_version(b) })
@@ -174,7 +176,7 @@ SOCKS5.prototype._read_method = function() {
 //  to do, and "SHOULD" support user/pass, which I am.
 
 
-SOCKS5.prototype._negotiate_auth = function(method) {
+SOCKS5WebSocket.prototype._negotiate_auth = function(method) {
   var self = this;
   // look up a handler for 'method'
   // points: this handler may return a promise, but it also might not
@@ -214,21 +216,21 @@ SOCKS5.prototype._negotiate_auth = function(method) {
 }
 
 
-SOCKS5.prototype.authmethods = {}
-SOCKS5.prototype.authmethods.NONE = function() {
+SOCKS5WebSocket.prototype.authmethods = {}
+SOCKS5WebSocket.prototype.authmethods.NONE = function() {
   return;
 }
 
-SOCKS5.prototype.authmethods.GSSAPI = function() {
+SOCKS5WebSocket.prototype.authmethods.GSSAPI = function() {
   throw "NotImplemented"
 }
-SOCKS5.prototype.authmethods.LOGIN = function() {
+SOCKS5WebSocket.prototype.authmethods.LOGIN = function() {
   throw "NotImplemented"
 }
 
 
 // 3) request the actual tunnel
-SOCKS5.prototype._negotiate_connection = function() {
+SOCKS5WebSocket.prototype._negotiate_connection = function() {
   
   this._stream.send(this._build_request("CONNECT", this.target)) //hardcoded to "CONNECT"; see the comments near the top
   
@@ -236,7 +238,7 @@ SOCKS5.prototype._negotiate_connection = function() {
 }
 
 
-SOCKS5.prototype._build_request = function(command, address) {
+SOCKS5WebSocket.prototype._build_request = function(command, address) {
     command = command.toUpperCase();
     
     command = this.commands[command]
@@ -273,7 +275,7 @@ SOCKS5.prototype._build_request = function(command, address) {
     return m
 }
 
-SOCKS5.prototype._read_reply = function() {
+SOCKS5WebSocket.prototype._read_reply = function() {
   // As a state machine, this process is:
   // [ read version ] -> [ read response ] -> [read reserved null byte] -> [error out]
   //                  |-> [error out]       |
@@ -367,7 +369,7 @@ SOCKS5.prototype._read_reply = function() {
 
 
 
-SOCKS5.prototype.send = function(d) {
+SOCKS5WebSocket.prototype.send = function(d) {
   // BEWARE: we send directly to self._ws here, though for cleanliness
   // in the init phase we should be using this._stream.
   //  but, because I *know* private details of WebSocketStream,
@@ -376,23 +378,23 @@ SOCKS5.prototype.send = function(d) {
   return this._ws.send(d)
 }
 
-SOCKS5.prototype.close = function() {
+SOCKS5WebSocket.prototype.close = function() {
   return this._ws.close();
 }
 
 // default no-op event handlers so that we needn't worry
 // about checking their existence before calling them.
-SOCKS5.prototype.onopen = function(evt) {} 
-SOCKS5.prototype.onmessage = function(evt) {} 
-SOCKS5.prototype.onclose = function(evt) {} 
-SOCKS5.prototype.onerror = function(evt) {} 
+SOCKS5WebSocket.prototype.onopen = function(evt) {} 
+SOCKS5WebSocket.prototype.onmessage = function(evt) {} 
+SOCKS5WebSocket.prototype.onclose = function(evt) {} 
+SOCKS5WebSocket.prototype.onerror = function(evt) {} 
 
 // These constants are hardcoded to correspond to their encoding within the protocol
 // SOCKS is simple enough that the constants it uses are all single bytes.
-SOCKS5.prototype.VERSION = String.fromCharCode(5) // i.e. SOCKS version 5
-SOCKS5.prototype.RSV = String.fromCharCode(0) //RESERVED byte
+SOCKS5WebSocket.prototype.VERSION = String.fromCharCode(5) // i.e. SOCKS version 5
+SOCKS5WebSocket.prototype.RSV = String.fromCharCode(0) //RESERVED byte
 
-SOCKS5.prototype.auth = {
+SOCKS5WebSocket.prototype.auth = {
                          NONE: String.fromCharCode(0),
                          GSSAPI: String.fromCharCode(1),
                          LOGIN: String.fromCharCode(2),
@@ -402,18 +404,18 @@ SOCKS5.prototype.auth = {
                          }
                          
                          
-SOCKS5.prototype.commands = {CONNECT: String.fromCharCode(1),
+SOCKS5WebSocket.prototype.commands = {CONNECT: String.fromCharCode(1),
                           BIND: String.fromCharCode(2),
                           UDP: String.fromCharCode(3)}
                          
-SOCKS5.prototype.atype = {
+SOCKS5WebSocket.prototype.atype = {
                           IPv4: String.fromCharCode(1),
                           DOMAINNAME: String.fromCharCode(3),
                           IPv6: String.fromCharCode(4)
                           }
 
 
-SOCKS5.prototype.responses = {OK: String.fromCharCode(0),
+SOCKS5WebSocket.prototype.responses = {OK: String.fromCharCode(0),
                              //TODO: there's 8 possible errors
                             }
 
