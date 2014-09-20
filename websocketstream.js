@@ -49,15 +49,17 @@ NOTE: only one of these can be active at a time; if you try to call recv() while
  * [ ] Is it actually necessary to force only one read at a time? Perhaps multiple reads could simply queue.
 */
 
-function WebSocketStream(addr) {
+function WebSocketStream(ws) {
   var self = this; //so that we can refer to the WebSocketStream from the WebSocket's event handlers
   
   this._buffer = ""; //TODO: use something more efficient than strings here ( see https://github.com/phoboslab/jsmpeg/blob/master/jsmpg.js#L90 for how )
   
   this._pending = null;
   
-  this._ws = new WebSocket(addr);
-  
+  if(typeof(ws) == "string") {
+    ws = new WebSocket(ws);
+  }
+  this._ws = ws;
   
   // 
   // event handlers need to be defined inside here
@@ -80,6 +82,7 @@ function WebSocketStream(addr) {
     self.onclose(e)
   }
   this._ws.onerror = function(e) { self.onerror(e) }
+  
 }
 
 WebSocketStream.prototype._pushbuffer = function(d) {
@@ -146,32 +149,28 @@ WebSocketStream.prototype.send = function(data) {
 
 
 WebSocketStream.prototype._recv = function(pend) {
+  // factorization of the common parts of all three recv()s
   if(this._pending !== null) {
     throw "A recv is already pending on " + this._ws.url;
   }
   
   pend.deferred = ayepromise.defer()
   this._pending = pend;
+  
+  this._pushbuffer("") //indirectly poll for whether we should immediately resolve the recv()
   return this._pending.deferred.promise;
 }
 
 WebSocketStream.prototype.recv = function(n) {
-  var promise = null;
   if(n === undefined) { // this should say "arguments.length == 0" but that's mysteriously misbehaving
-    promise = this._recv({type: this._RECV})
+    return this._recv({type: this._RECV})
   } else {
-    promise = this._recv({type: this._RECVn, n: n})
+    return this._recv({type: this._RECVn, n: n})
   }
-  
-  this._pushbuffer("") //indirectly poll for whether we should immediately resolve the recv()
-  return promise;
 }
   
 WebSocketStream.prototype.recvline = function() {
-  var promise = this._recv({type: this._RECVLINE})
-  
-  this._pushbuffer("") //indirectly poll for whether we should immediately resolve the recv()
-  return promise;
+  return this._recv({type: this._RECVLINE})
 }
 
 WebSocketStream.prototype.close = function() {
