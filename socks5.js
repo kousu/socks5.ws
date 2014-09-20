@@ -37,9 +37,6 @@
 }(this, function () {
     'use strict';
 
-if(!WebSocket) {
-  var WebSocket = require("ws");
-}
 if(!WebSocketStream) {
   var WebSocketStream = require("./websocketstream.js") 
 }
@@ -90,10 +87,9 @@ function SOCKS5(proxy, auth_callback) {
     self.remote = { host: null, port: null } //the address of the remote end of the tunnel
     
     // Internally we use a WebSocketStream to do the initial setup
-    self._ws = new WebSocket(proxy)
-    self._stream = new WebSocketStream(this._ws)
+    self._ws = new WebSocketStream(proxy)
     
-    self._stream.onopen = function(evt) {
+    self._ws.onopen = function(evt) {
       self._connect()
     }
     
@@ -125,15 +121,13 @@ SOCKS5.prototype._connect = function() {
   var self = this;
   return this._negotiate_method()
     .then(function(m) { 
-      console.log("negotiating auth method", m)
       return self._negotiate_auth(m) }) //the wrapping is because then() suffers from changing what 'this' is
     .then(function() { 
       return self._negotiate_connection() })
     .then(function() { 
       // C) Get out of the way: just forward packets
-      //   we *disable* the WebSocketStream and redirect the onmessage
-      delete self._stream;
-      self._ws.onmessage = function(e) { self.onmessage(e) }
+      //   we *disable* the WebSocketStream when we do this by stealing the onmessage
+      self._ws._ws.onmessage = function(e) { self.onmessage(e) }
       return self.onopen({/*XXX fill in some sensible event result here */})
       })
     .fail(function(e) { self.onerror(e) }) //chain exceptions out to the event handler
@@ -144,7 +138,7 @@ SOCKS5.prototype._connect = function() {
 // 1) negotiate an connection method (i.e. an auth method, though encryption and digital signatures are theoretically an option here too);
 
 SOCKS5.prototype._negotiate_method = function() {
-  this._stream.send(this._build_method_selection([this.auth.NONE]))
+  this._ws.send(this._build_method_selection([this.auth.NONE]))
   
   return this._read_method();
 }
@@ -162,10 +156,11 @@ SOCKS5.prototype._build_method_selection = function(methods) {
 
 
 SOCKS5.prototype._read_method = function() {
+  var ws = this._ws;
   var self = this;
-  return self._stream.recv(1)
+  return ws.recv(1)
     .then(function(b) { self._validate_version(b) })
-    .then(function() { return self._stream.recv(1); })
+    .then(function() { return ws.recv(1); })
 }
 
 
@@ -183,7 +178,7 @@ SOCKS5.prototype._negotiate_auth = function(method) {
     
     //"If the selected METHOD is X'FF', none of the methods listed by the
     // client are acceptable, and the client MUST close the connection."
-    self._stream.close(); //"client MUST close"
+    this._ws.close(); //"client MUST close"
     
     //and we error out too, for good measure
     throw "SOCKS server rejected all our auth methods." 
@@ -224,13 +219,15 @@ SOCKS5.prototype.authmethods.GSSAPI = function() {
 }
 SOCKS5.prototype.authmethods.LOGIN = function() {
   throw "NotImplemented"
+  //this.send(....)
+  //return ws.read(loginresponselength).then() .... 
 }
 
 
 // 3) request the actual tunnel
 SOCKS5.prototype._negotiate_connection = function() {
   
-  this._stream.send(this._build_request("CONNECT", this.target)) //hardcoded to "CONNECT"; see the comments near the top
+  this._ws.send(this._build_request("CONNECT", this.target)) //hardcoded to "CONNECT"; see the comments near the top
   
   return this._read_reply();
 }
@@ -302,13 +299,14 @@ SOCKS5.prototype._read_reply = function() {
   //    are basically boilerplate around the real process. 
   
   var self = this;
+  var ws = this._ws;
   
   // check the remote server version
-  return self._stream.recv(1)
+  return ws.recv(1)
   .then(function(b) { return self._validate_version(b) })
   
   // parse the response type
-  .then(function()  { return self._stream.recv(1) })
+  .then(function()  { return ws.recv(1) })
   .then(function(b) {
     if(b != self.responses.OK) {
       throw "SOCKS tunnel refused"
@@ -318,7 +316,7 @@ SOCKS5.prototype._read_reply = function() {
   
   // check that the 'reserved' byte is actually unused;
   // if it's not, we might be not talking to SOCKS
-  .then(function() { return self._stream.recv(1) }) // NB: Promises/A+ says that you can chain promises: http://promisesaplus.com/#point-49
+  .then(function() { return ws.recv(1) }) // NB: Promises/A+ says that you can chain promises: http://promisesaplus.com/#point-49
   .then(function(b) {
     if(b != self.RSV ) { 
       throw "Malformed SOCKS reply"
@@ -328,26 +326,26 @@ SOCKS5.prototype._read_reply = function() {
   
   // determine the length of the next field, which is "bind.addr",
   // telling us what our remote host is
-  .then(function() { return self._stream.recv(1) })
+  .then(function() { return ws.recv(1) })
   .then(function(b) {
     switch(b) {
       case self.atype.IPv4: //ipv4: 4 bytes
-        return self._stream.recv(4).then(function(addr) {
+        return ws.recv(4).then(function(addr) {
           //TODO: parse the bytes into a IP string
           self.remote.host = addr;
         })
         break;
       case self.atype.DOMAINNAME: // domain name: a fortran-style string (so we need to read 1 byte to find out the length)
-        return self._stream.recv(1).then(function(h) {
+        return ws.recv(1).then(function(h) {
           h = h.charCodeAt(0) //extract the number of bytes to read
-          self._stream.recv(h).then(function(addr) {
+          ws.recv(h).then(function(addr) {
             //the string as given is a string
             self.remote.host = addr;
           })
         })
         break;
       case self.atype.IPv6: //ipv6: 16 bytes
-        return self._stream.recv(16).then(function(addr) {
+        return ws.recv(16).then(function(addr) {
           //TODO: parse the octets into a string
           self.remote.host = addr;
         })
@@ -358,7 +356,7 @@ SOCKS5.prototype._read_reply = function() {
   })
   
   // finally, read the port
-  .then(function() { return self._stream.recv(2) })
+  .then(function() { return ws.recv(2) })
   .then(function(b) {
     self.remote.port = b.charCodeAt(0) << 8 | b.charCodeAt(1)
   })
@@ -368,11 +366,6 @@ SOCKS5.prototype._read_reply = function() {
 
 
 SOCKS5.prototype.send = function(d) {
-  // BEWARE: we send directly to self._ws here, though for cleanliness
-  // in the init phase we should be using this._stream.
-  //  but, because I *know* private details of WebSocketStream,
-  //  namely that .send() is a simple proxy,
-  //  this will do the correct thing either way.
   return this._ws.send(d)
 }
 

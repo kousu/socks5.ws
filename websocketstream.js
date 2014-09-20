@@ -61,6 +61,7 @@ function WebSocketStream(ws) {
   }
   this._ws = ws;
   
+  // 
   // event handlers need to be defined inside here
   // in order to pick up 'self' not cause infinite recurision
   //  saying .e.g this._ws.onopen = this._onopen does the wrong thing, because js doesn't care that this._onopen comes from this, it runs it with this=this._ws
@@ -72,7 +73,7 @@ function WebSocketStream(ws) {
   // proxy some WebSocket events up unmolested
   this._ws.onopen = function(e) { self.onopen(e) }
   this._ws.onclose = function(e) {
-    // check for and clear out a pending RECV
+    // clear out a pending .recv()
     if(self._pending !== null) {
       if(self._pending.type == self._RECV) {
         self._pending.deferred.resolve(self._buffer)
@@ -81,6 +82,7 @@ function WebSocketStream(ws) {
     self.onclose(e)
   }
   this._ws.onerror = function(e) { self.onerror(e) }
+  
 }
 
 WebSocketStream.prototype._pushbuffer = function(d) {
@@ -109,18 +111,18 @@ WebSocketStream.prototype._pushbuffer = function(d) {
       // "complete" the pend; i.e. null out _pending
       self._pending = null; //it's important to complete *before* resolving,
                             //since the resolution handler might--is likely to, even--call recv() again
-      
       p.deferred.resolve(d)
     }
-  }
+  } 
 }
 
-//TODO: .prototoype._recv = { NONE: 0, ..}
+ //TODO: .prototoype._recv = { NONE: 0, ..}
 WebSocketStream.prototype._RECVNONE = 0
 WebSocketStream.prototype._RECVn = 1
 WebSocketStream.prototype._RECVLINE = 2
 WebSocketStream.prototype._RECV = 3 //XXX NotImplemented
-
+  
+  
 // default no-op event handlers so that we needn't worry
 // about checking their existence before calling them.
 WebSocketStream.prototype.onopen = function(evt) {} 
@@ -128,6 +130,7 @@ WebSocketStream.prototype.onclose = function(evt) {}
 WebSocketStream.prototype.onerror = function(evt) {} 
 
 WebSocketStream.prototype.send = function(data) {
+  
   if(typeof(data) === "string") {
     //Bad Things Happen if we let the websocket library send the data,
     //  namely it UTF-8 encodes it
@@ -151,16 +154,11 @@ WebSocketStream.prototype._recv = function(pend) {
     throw "A recv is already pending on " + this._ws.url;
   }
   
-  pend.deferred = ayepromise.defer();
+  pend.deferred = ayepromise.defer()
   this._pending = pend;
   
-  var promise = this._pending.deferred.promise;
-  this._pushbuffer("") //poll--indirectly--for whether
-                       // we should immediately resolve.
-                       //Note! This might erase _pending,
-                       // which is why we pre-stash promise.
-                       //XXX this is written awkwardly; TODO: .test_resolve() subroutine??
-  return promise;
+  this._pushbuffer("") //indirectly poll for whether we should immediately resolve the recv()
+  return this._pending.deferred.promise;
 }
 
 WebSocketStream.prototype.recv = function(n) {
