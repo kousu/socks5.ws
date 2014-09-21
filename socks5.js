@@ -226,8 +226,6 @@ SOCKS5WebSocket.prototype = {
   _negotiate_auth: function(method) {
     var self = this;
     // look up a handler for 'method'
-    // points: this handler may return a promise, but it also might not
-    //  this handler is run with this = [the SOCKS5]
     if(method == this.auth.UNACCEPTABLE) {
       
       //"If the selected METHOD is X'FF', none of the methods listed by the
@@ -253,12 +251,16 @@ SOCKS5WebSocket.prototype = {
     
     var handler = this.authmethods[find_method()]
       
-    // Note! handler might here overwrite this._ws here with a further
-    //   wrapper because:
+    // points:
+    // * handler may return a promise, but it also might not
+    // * the handler is run with this = [the SOCKS5] instead of this = whereever it was defined in, which is the same (IMO confusing) way that all js event handlers run
+    // * handler might here overwrite this._ws here with a further wrapper because:
     // > If the negotiated method includes encapsulation [...]
     // > these requests MUST be encapsulated in the method-
     // > dependent encapsulation.
     // - <https://tools.ietf.org/html/rfc1928#section-4> 
+    //  XXX overwriting this._ws requires redirecting its event handlers too!!
+    
     return handler.call(this)
   },
 
@@ -268,7 +270,6 @@ SOCKS5WebSocket.prototype = {
     NONE = function() {
       return;
     },
-
     GSSAPI: function() {
       throw "NotImplemented"
     },
