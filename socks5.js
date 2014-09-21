@@ -73,6 +73,7 @@ function build_int(n) {
 function SOCKS5(proxy, auth_callback) {
   /* This partially-evaluates SOCKS5WebSocket
    *  doing this requires bending over backwards a bit, because we want to support 'new'
+   *  and 'new' in js does some funny things.
    *  hence, we basically dynamically create a subclass which closes over 'proxy' and 'auth_callback'
    */
   function WebSocket(address, protocols) {
@@ -89,11 +90,12 @@ function SOCKS5WebSocket(proxy, auth_callback, address, protocols) {
    *  reference: https://tools.ietf.org/html/rfc1928
    *  
    * This class only implements TCP CONNECT SOCKS; SOCKS also allows UDP and even BIND modes, but those types require distinctly different APIs (UDP needs .send() and .onmessage; BIND only allows one remote TCP connection (i.e. it's not a full listen()+accept() implementation) but presumably there should be an intermediate state for "connected to the proxy but no one is connected to us"
+   *
+   * This class is duck-typed such that it's compatible as a WebSocket, but it also has some extra methods and properties.
    */
  
   var self = this;
   self.target = address;
-  self.remote = { host: null, port: null } //the address of the remote end of the tunnel
   
   self._ws = new WebSocket(proxy)
   
@@ -116,309 +118,340 @@ function SOCKS5WebSocket(proxy, auth_callback, address, protocols) {
 }
 
 
-SOCKS5WebSocket.prototype._validate_version = function(b) {
-  if(b != this.VERSION) { 
-    throw "Unsupported SOCKS version"
-  }
-}
+SOCKS5WebSocket.prototype = {
+
+  /* Enums
+   *
+   * These constants are hardcoded to correspond to their encoding within the protocol
+   * SOCKS is simple enough that the constants it uses are all single bytes.
+   *
+   * TODO: use numbers here and only call fromCharCode() or its 
+           (near-)inverse charCodeAt() when actually parsing 
+   */
+
+  VERSION: String.fromCharCode(5), // i.e. SOCKS version 5
+  RSV: String.fromCharCode(0), //RESERVED byte
+
+  auth: { NONE: String.fromCharCode(0),
+          GSSAPI: String.fromCharCode(1),
+          LOGIN: String.fromCharCode(2),
+          UNACCEPTABLE: String.fromCharCode(0xFF),
+         // all others are reserved either by IANA or for custom use
+         // i.e. probably no one uses them(?)
+         // XXX double check this 
+         },
+                                           
+  commands: { CONNECT: String.fromCharCode(1),
+              BIND: String.fromCharCode(2),
+              UDP: String.fromCharCode(3)
+            },
+                           
+  atype: {  IPv4: String.fromCharCode(1),
+            DOMAINNAME: String.fromCharCode(3),
+            IPv6: String.fromCharCode(4)
+         },
+
+  responses = {OK: String.fromCharCode(0),
+                               //TODO: there's 8 possible error response codes
+                              },
 
 
-// B) connect to the SOCKS server  
-  
-SOCKS5WebSocket.prototype._connect = function() {
-  var self = this;
-  return this._negotiate_method()
-    .then(function(m) { return self._negotiate_auth(m) }) //the wrapping is because then() suffers from changing what 'this' is
-    .then(function() { 
-      return self._negotiate_connection() })
-    .then(function() { 
-      // C) Get out of the way: just forward packets
-      //   we *disable* the WebSocketStream and redirect the onmessage
-      delete self._stream;
-      self._ws.onmessage = function(e) { self.onmessage(e) }
-      return self.onopen({/*XXX fill in some sensible event result here */})
+  /* Private helper methods
+   *
+   * Mostly these are the different steps of the SOCKS negotiation,
+   *  chunked into subroutines for readability
+   */ 
+
+
+  _validate_version: function(b) {
+    if(b != this.VERSION) { 
+      throw "Unsupported SOCKS version"
+    }
+  },
+
+
+  // B) connect to the SOCKS server  
+    
+  _connect: function() {
+    var self = this;
+    return this._negotiate_method()
+      .then(function(m) { return self._negotiate_auth(m) }) //the wrapping is because then() suffers from changing what 'this' is
+      .then(function() { 
+        return self._negotiate_connection() })
+      .then(function() { 
+        // C) Get out of the way: just forward packets
+        //   we *disable* the WebSocketStream and redirect the onmessage
+        delete self._stream;
+        self._ws.onmessage = function(e) { self.onmessage(e) }
+        return self.onopen({/*XXX fill in some sensible event result here */})
+        })
+      .fail(function(e) { self.onerror(e) }) //chain exceptions out to the event handler
+  },
+
+
+
+  // 1) negotiate an connection method (i.e. an auth method, though encryption and digital signatures are theoretically an option here too);
+
+  _negotiate_method: function() {
+    this._stream.send(this._build_method_selection([this.auth.NONE]))
+    
+    return this._read_method();
+  },
+
+
+
+  _build_method_selection: function(methods) {
+    // precondition: methods is a subset of this.auth
+    // XXX this precondition isn't enforced!
+    
+    var nmethods = methods.length;
+    
+    return this.VERSION + build_int(nmethods) + methods.join('')
+  },
+
+
+  _read_method: function() {
+    var self = this;
+    return self._stream.recv(1)
+      .then(function(b) { self._validate_version(b) })
+      .then(function() { return self._stream.recv(1); })
+  },
+
+
+  // 2) negotiate the authentication;
+  //  the spec says we "MUST" support GSSAPI, which I'm not going 
+  //  to do, and "SHOULD" support user/pass, which I am.
+
+
+  _negotiate_auth: function(method) {
+    var self = this;
+    // look up a handler for 'method'
+    // points: this handler may return a promise, but it also might not
+    //  this handler is run with this = [the SOCKS5]
+    if(method == this.auth.UNACCEPTABLE) {
+      
+      //"If the selected METHOD is X'FF', none of the methods listed by the
+      // client are acceptable, and the client MUST close the connection."
+      self._stream.close(); //"client MUST close"
+      
+      //and we error out too, for good measure
+      throw "SOCKS server rejected all our auth methods." 
+    }
+    
+    function find_method() {
+      var s = null;
+      // .find() didn't work. for(k in self.auth) didn't work.
+      // maybe things are different under Firefox??
+      // So I fall back to using a global 's'
+      Object.keys(self.auth).forEach(function(k) { //XXX this code feels like it probably exists in the stdlib somewhere
+        if(self.auth[k].charCodeAt(0) == method.charCodeAt(0)) s = k;
       })
-    .fail(function(e) { self.onerror(e) }) //chain exceptions out to the event handler
-}
-
-
-
-// 1) negotiate an connection method (i.e. an auth method, though encryption and digital signatures are theoretically an option here too);
-
-SOCKS5WebSocket.prototype._negotiate_method = function() {
-  this._stream.send(this._build_method_selection([this.auth.NONE]))
-  
-  return this._read_method();
-}
-
-
-
-SOCKS5WebSocket.prototype._build_method_selection = function(methods) {
-  // precondition: methods is a subset of this.auth
-  // XXX this precondition isn't enforced!
-  
-  var nmethods = methods.length;
-  
-  return this.VERSION + build_int(nmethods) + methods.join('')
-}
-
-
-SOCKS5WebSocket.prototype._read_method = function() {
-  var self = this;
-  return self._stream.recv(1)
-    .then(function(b) { self._validate_version(b) })
-    .then(function() { return self._stream.recv(1); })
-}
-
-
-// 2) negotiate the authentication;
-//  the spec says we "MUST" support GSSAPI, which I'm not going 
-//  to do, and "SHOULD" support user/pass, which I am.
-
-
-SOCKS5WebSocket.prototype._negotiate_auth = function(method) {
-  var self = this;
-  // look up a handler for 'method'
-  // points: this handler may return a promise, but it also might not
-  //  this handler is run with this = [the SOCKS5]
-  if(method == this.auth.UNACCEPTABLE) {
+      
+      if(s) return s;
+      throw "Unknown auth method" //Shouldn't happen but not impossible; a conforming server should only respond with a method in the list we sent
+    }
     
-    //"If the selected METHOD is X'FF', none of the methods listed by the
-    // client are acceptable, and the client MUST close the connection."
-    self._stream.close(); //"client MUST close"
+    var handler = this.authmethods[find_method()]
+      
+    // Note! handler might here overwrite this._ws here with a further
+    //   wrapper because:
+    // > If the negotiated method includes encapsulation [...]
+    // > these requests MUST be encapsulated in the method-
+    // > dependent encapsulation.
+    // - <https://tools.ietf.org/html/rfc1928#section-4> 
+    return handler.call(this)
+  },
+
+
+  authmethods = { // This is not "private" so that users are encouraged to define their own handlers here
+    //XXX this part is not well fleshed out; SOCKS server that even support auth are rare
+    NONE = function() {
+      return;
+    },
+
+    GSSAPI: function() {
+      throw "NotImplemented"
+    },
+    LOGIN: function() {
+      throw "NotImplemented"
+    }
+  },
+
+
+  // 3) request the actual tunnel
+  _negotiate_connection: function() {
+    this._stream.send(this._build_request("CONNECT", this.target)) //hardcoded to "CONNECT"; see the comments near the top
     
-    //and we error out too, for good measure
-    throw "SOCKS server rejected all our auth methods." 
-  }
-  
-  function find_method() {
-    var s = null;
-    // .find() didn't work. for(k in self.auth) didn't work.
-    // maybe things are different under Firefox??
-    // So I fall back to using a global 's'
-    Object.keys(self.auth).forEach(function(k) { //XXX this code feels like it probably exists in the stdlib somewhere
-      if(self.auth[k].charCodeAt(0) == method.charCodeAt(0)) s = k;
+    return this._read_reply();
+  },
+
+
+  _build_request: function(command, address) {
+      command = command.toUpperCase();
+      
+      command = this.commands[command]
+      if(command === undefined) {
+        throw "Invalid SOCKS command."
+      }
+      
+      // XXX for now, address is hardcoded as DOMAINAME
+      //  most DNS resolvers should be able to handle text-formatted IPv4 and IPv6 addresses...
+      var atype = this.atype.DOMAINNAME
+      
+      address = split_addr(address)
+      var host = address[0]
+      var port = address[1]
+      
+      // format address as a fortran-style string
+      if(host.length > 0xFF) {
+        throw "Target hostname too long to encode."
+      }
+      var n = String.fromCharCode(host.length)
+      host = n + host
+      
+      // and finally, the port
+      if(port === null) { //XXX maybe this should be inside of spit_addr
+        throw "Target port must be specified when using SOCKS5."
+      }
+      
+      // "in network octet order"
+      port = +port; //convert to an integer
+      port = String.fromCharCode((port & 0xFF00) >> 8) + String.fromCharCode(port & 0xFF)
+      
+      
+      var m = this.VERSION + command + this.RSV + atype + host + port;
+      return m
+  },
+
+  _read_reply: function() {
+    // As a state machine, this process is:
+    // [ read version ] -> [ read response ] -> [read reserved null byte] -> [error out]
+    //                  |-> [error out]       |
+    //                                        v
+    //                                 [read address type]
+    //                   [read ipv4]    [read domainname]     [readipv6]
+    //                                     [read port]
+    //
+    // Because the message is a fixed size up to reading the address, I avoiding having to kludge
+    //  around this by just saying .recv(4) and then using standard if statements instead of a chain of .recv(1)s
+    //  but because this step comes after the split, it needs to
+    
+
+   //the trick here is that promises chain: .then() records the handler you pass it and then returns a new promise which will be fired after that promise completes and finishes the handler 
+   // how do I write branching with promises?
+   //  Promises/A+ makes it easy enough to write a chain of steps and
+   //   get async almost free (the only expense is some repetition: .then().then().then()....)
+   // MSFT even has an excellent doc on doing this: http://msdn.microsoft.com/en-us/library/windows/apps/Hh700334.aspx
+   //
+   // In principle, you should be able to have a promise that represents
+   // the final result of a branching
+   // How to express this is escaping me at the moment.
+
+    //NB: the non-lint'd indenting is on purpose here!
+    //    The correct indents would distract, because the .then()s
+    //    are basically boilerplate around the real process. 
+    
+    var self = this;
+    
+    // check the remote server version
+    return self._stream.recv(1)
+    .then(function(b) { return self._validate_version(b) })
+    
+    // parse the response type
+    .then(function()  { return self._stream.recv(1) })
+    .then(function(b) {
+      if(b != self.responses.OK) {
+        throw "SOCKS tunnel refused"
+        //TODO: give more detailed error message based on what b is
+      }
     })
     
-    if(s) return s;
-    throw "Unknown auth method" //Shouldn't happen but not impossible; a conforming server should only respond with a method in the list we sent
-  }
-  
-  var handler = this.authmethods[find_method()]
-    
-  // Note! handler might here overwrite this._ws here with a further
-  //   wrapper because:
-  // > If the negotiated method includes encapsulation [...]
-  // > these requests MUST be encapsulated in the method-
-  // > dependent encapsulation.
-  // - <https://tools.ietf.org/html/rfc1928#section-4> 
-  return handler.call(this)
-}
-
-
-SOCKS5WebSocket.prototype.authmethods = {}
-SOCKS5WebSocket.prototype.authmethods.NONE = function() {
-  return;
-}
-
-SOCKS5WebSocket.prototype.authmethods.GSSAPI = function() {
-  throw "NotImplemented"
-}
-SOCKS5WebSocket.prototype.authmethods.LOGIN = function() {
-  throw "NotImplemented"
-}
-
-
-// 3) request the actual tunnel
-SOCKS5WebSocket.prototype._negotiate_connection = function() {
-  
-  this._stream.send(this._build_request("CONNECT", this.target)) //hardcoded to "CONNECT"; see the comments near the top
-  
-  return this._read_reply();
-}
-
-
-SOCKS5WebSocket.prototype._build_request = function(command, address) {
-    command = command.toUpperCase();
-    
-    command = this.commands[command]
-    if(command === undefined) {
-      throw "Invalid SOCKS command."
-    }
-    
-    // XXX for now, address is hardcoded as DOMAINAME
-    //  most DNS resolvers should be able to handle text-formatted IPv4 and IPv6 addresses...
-    var atype = this.atype.DOMAINNAME
-    
-    address = split_addr(address)
-    var host = address[0]
-    var port = address[1]
-    
-    // format address as a fortran-style string
-    if(host.length > 0xFF) {
-      throw "Target hostname too long to encode."
-    }
-    var n = String.fromCharCode(host.length)
-    host = n + host
-    
-    // and finally, the port
-    if(port === null) { //XXX maybe this should be inside of spit_addr
-      throw "Target port must be specified when using SOCKS5."
-    }
-    
-    // "in network octet order"
-    port = +port; //convert to an integer
-    port = String.fromCharCode((port & 0xFF00) >> 8) + String.fromCharCode(port & 0xFF)
+    // check that the 'reserved' byte is actually unused;
+    // if it's not, we might be not talking to SOCKS
+    .then(function() { return self._stream.recv(1) }) // NB: Promises/A+ says that you can chain promises: http://promisesaplus.com/#point-49
+    .then(function(b) {
+      if(b != self.RSV ) { 
+        throw "Malformed SOCKS reply"
+      }
+    })
     
     
-    var m = this.VERSION + command + this.RSV + atype + host + port;
-    return m
-}
-
-SOCKS5WebSocket.prototype._read_reply = function() {
-  // As a state machine, this process is:
-  // [ read version ] -> [ read response ] -> [read reserved null byte] -> [error out]
-  //                  |-> [error out]       |
-  //                                        v
-  //                                 [read address type]
-  //                   [read ipv4]    [read domainname]     [readipv6]
-  //                                     [read port]
-  //
-  // Because the message is a fixed size up to reading the address, I avoiding having to kludge
-  //  around this by just saying .recv(4) and then using standard if statements instead of a chain of .recv(1)s
-  //  but because this step comes after the split, it needs to
-  
-
- //the trick here is that promises chain: .then() records the handler you pass it and then returns a new promise which will be fired after that promise completes and finishes the handler 
- // how do I write branching with promises?
- //  Promises/A+ makes it easy enough to write a chain of steps and
- //   get async almost free (the only expense is some repetition: .then().then().then()....)
- // MSFT even has an excellent doc on doing this: http://msdn.microsoft.com/en-us/library/windows/apps/Hh700334.aspx
- //
- // In principle, you should be able to have a promise that represents
- // the final result of a branching
- // How to express this is escaping me at the moment.
-
-  //NB: the non-lint'd indenting is on purpose here!
-  //    The correct indents would distract, because the .then()s
-  //    are basically boilerplate around the real process. 
-  
-  var self = this;
-  
-  // check the remote server version
-  return self._stream.recv(1)
-  .then(function(b) { return self._validate_version(b) })
-  
-  // parse the response type
-  .then(function()  { return self._stream.recv(1) })
-  .then(function(b) {
-    if(b != self.responses.OK) {
-      throw "SOCKS tunnel refused"
-      //TODO: give more detailed error message based on what b is
-    }
-  })
-  
-  // check that the 'reserved' byte is actually unused;
-  // if it's not, we might be not talking to SOCKS
-  .then(function() { return self._stream.recv(1) }) // NB: Promises/A+ says that you can chain promises: http://promisesaplus.com/#point-49
-  .then(function(b) {
-    if(b != self.RSV ) { 
-      throw "Malformed SOCKS reply"
-    }
-  })
-  
-  
-  // determine the length of the next field, which is "bind.addr",
-  // telling us what our remote host is
-  .then(function() { return self._stream.recv(1) })
-  .then(function(b) {
-    switch(b) {
-      case self.atype.IPv4: //ipv4: 4 bytes
-        return self._stream.recv(4).then(function(addr) {
-          //TODO: parse the bytes into a IP string
-          self.remote.host = addr;
-        })
-        break;
-      case self.atype.DOMAINNAME: // domain name: a fortran-style string (so we need to read 1 byte to find out the length)
-        return self._stream.recv(1).then(function(h) {
-          h = h.charCodeAt(0) //extract the number of bytes to read
-          self._stream.recv(h).then(function(addr) {
-            //the string as given is a string
+    // determine the length of the next field, which is "bind.addr",
+    // telling us what our remote host is
+    .then(function() { return self._stream.recv(1) })
+    .then(function(b) {
+      switch(b) {
+        case self.atype.IPv4: //ipv4: 4 bytes
+          return self._stream.recv(4).then(function(addr) {
+            //TODO: parse the bytes into a IP string
             self.remote.host = addr;
           })
-        })
-        break;
-      case self.atype.IPv6: //ipv6: 16 bytes
-        return self._stream.recv(16).then(function(addr) {
-          //TODO: parse the octets into a string
-          self.remote.host = addr;
-        })
-        break;
-      default:
-        throw "Received unknown address type";
-      }
-  })
-  
-  // finally, read the port
-  .then(function() { return self._stream.recv(2) })
-  .then(function(b) {
-    self.remote.port = b.charCodeAt(0) << 8 | b.charCodeAt(1)
-  })
-      
+          break;
+        case self.atype.DOMAINNAME: // domain name: a fortran-style string (so we need to read 1 byte to find out the length)
+          return self._stream.recv(1).then(function(h) {
+            h = h.charCodeAt(0) //extract the number of bytes to read
+            self._stream.recv(h).then(function(addr) {
+              //the string as given is a string
+              self.remote.host = addr;
+            })
+          })
+          break;
+        case self.atype.IPv6: //ipv6: 16 bytes
+          return self._stream.recv(16).then(function(addr) {
+            //TODO: parse the octets into a string
+            self.remote.host = addr;
+          })
+          break;
+        default:
+          throw "Received unknown address type";
+        }
+    })
+    
+    // finally, read the port
+    .then(function() { return self._stream.recv(2) })
+    .then(function(b) {
+      self.remote.port = b.charCodeAt(0) << 8 | b.charCodeAt(1)
+    })
+        
+  },
+
+
+  /* Public API
+   *
+   */ 
+
+
+  /* variables */
+
+  target: null,
+  remote: { host: null, port: null }, //the address of the remote end of the tunnel
+
+  //TODO: readyState, etc
+
+  /* methods */
+
+  // default no-op event handlers so that we needn't worry
+  // about checking their existence before calling them.
+  // User overwrites these--as with normal WebSockets--to hook events.
+  onopen: function(evt) {},
+  onmessage: function(evt) {}, 
+  onclose: function(evt) {},
+  onerror: function(evt) {},
+
+  send: function(d) {
+    // BEWARE: we send directly to self._ws here, though for cleanliness
+    // in the init phase we should be using this._stream.
+    //  but, because I *know* private details of WebSocketStream,
+    //  namely that .send() is a simple proxy,
+    //  this will do the correct thing either way.
+    return this._ws.send(d)
+  },
+
+  close: function() {
+    return this._ws.close();
+  }
+
 }
-
-
-
-SOCKS5WebSocket.prototype.send = function(d) {
-  // BEWARE: we send directly to self._ws here, though for cleanliness
-  // in the init phase we should be using this._stream.
-  //  but, because I *know* private details of WebSocketStream,
-  //  namely that .send() is a simple proxy,
-  //  this will do the correct thing either way.
-  return this._ws.send(d)
-}
-
-SOCKS5WebSocket.prototype.close = function() {
-  return this._ws.close();
-}
-
-// default no-op event handlers so that we needn't worry
-// about checking their existence before calling them.
-SOCKS5WebSocket.prototype.onopen = function(evt) {} 
-SOCKS5WebSocket.prototype.onmessage = function(evt) {} 
-SOCKS5WebSocket.prototype.onclose = function(evt) {} 
-SOCKS5WebSocket.prototype.onerror = function(evt) {} 
-
-// These constants are hardcoded to correspond to their encoding within the protocol
-// SOCKS is simple enough that the constants it uses are all single bytes.
-SOCKS5WebSocket.prototype.VERSION = String.fromCharCode(5) // i.e. SOCKS version 5
-SOCKS5WebSocket.prototype.RSV = String.fromCharCode(0) //RESERVED byte
-
-SOCKS5WebSocket.prototype.auth = {
-                         NONE: String.fromCharCode(0),
-                         GSSAPI: String.fromCharCode(1),
-                         LOGIN: String.fromCharCode(2),
-                         UNACCEPTABLE: String.fromCharCode(0xFF),
-                         // all others are reserved either by IANA or for custom use
-                         // i.e. probably no one uses them(?) 
-                         }
-                         
-                         
-SOCKS5WebSocket.prototype.commands = {CONNECT: String.fromCharCode(1),
-                          BIND: String.fromCharCode(2),
-                          UDP: String.fromCharCode(3)}
-                         
-SOCKS5WebSocket.prototype.atype = {
-                          IPv4: String.fromCharCode(1),
-                          DOMAINNAME: String.fromCharCode(3),
-                          IPv6: String.fromCharCode(4)
-                          }
-
-
-SOCKS5WebSocket.prototype.responses = {OK: String.fromCharCode(0),
-                             //TODO: there's 8 possible errors
-                            }
-
 
 return SOCKS5;
 }));
