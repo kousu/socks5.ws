@@ -135,7 +135,9 @@ SOCKS5WebSocket.prototype._connect = function() {
       //   we *disable* the WebSocketStream and redirect the onmessage
       delete self._stream;
       self._ws.onmessage = function(e) { self.onmessage(e) }
-      return self.onopen({/*XXX fill in some sensible event result here */})
+      self.onopen({/*XXX fill in some sensible event result here */})
+      
+      // should this step return anything?
       })
     .fail(function(e) { self.onerror(e) }) //chain exceptions out to the event handler
 }
