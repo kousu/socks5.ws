@@ -127,11 +127,10 @@ SOCKS5WebSocket.prototype._validate_version = function(b) {
   
 SOCKS5WebSocket.prototype._connect = function() {
   var self = this;
-  return this._negotiate_method()
-    .then(function(m) { return self._negotiate_auth(m) }) //the wrapping is because then() suffers from changing what 'this' is
-    .then(function() { 
-      return self._negotiate_connection() })
-    .then(function() { 
+  return                       self._negotiate_method()
+    .then(function(m) { return self._negotiate_auth(m) }) //the wrapping of _negotiate_auth() is because then() suffers from changing what 'this' is
+    .then(function( ) { return self._negotiate_connection() })
+    .then(function( ) { 
       // C) Get out of the way: just forward packets
       //   we *disable* the WebSocketStream and redirect the onmessage
       delete self._stream;
